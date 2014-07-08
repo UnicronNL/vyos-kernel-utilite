@@ -232,6 +232,13 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define WHITEOUT_DEV 0
 
 /*
+ * Whiteout is represented by a char device.  The following constants define the
+ * mode and device number to use.
+ */
+#define WHITEOUT_MODE 0
+#define WHITEOUT_DEV 0
+
+/*
  * This is the Inode Attributes structure, used for notify_change().  It
  * uses the above definitions as flags, to know which values have changed.
  * Also, in this manner, a Filesystem can look at only the values it cares
