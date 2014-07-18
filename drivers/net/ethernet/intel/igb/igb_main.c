@@ -2425,9 +2425,9 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	memcpy(netdev->dev_addr, hw->mac.addr, netdev->addr_len);
 
 	if (!is_valid_ether_addr(netdev->dev_addr)) {
-		dev_err(&pdev->dev, "Invalid MAC Address\n");
-		err = -EIO;
-		goto err_eeprom;
+		dev_err(&pdev->dev, "Invalid MAC Address, using random address\n");
+		random_ether_addr(netdev->dev_addr);
+		memcpy(hw->mac.addr, netdev->dev_addr, netdev->addr_len);
 	}
 
 	/* get firmware version for ethtool -i */
