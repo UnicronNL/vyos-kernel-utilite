@@ -2407,6 +2407,8 @@ static struct miscdevice tun_miscdev = {
 
 static int tun_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 {
+	struct tun_struct *tun = netdev_priv(dev);
+
 	cmd->supported		= 0;
 	cmd->advertising	= 0;
 	ethtool_cmd_speed_set(cmd, tun->speed);
@@ -2437,7 +2439,7 @@ static void tun_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info
 {
 	struct tun_struct *tun = netdev_priv(dev);
 
-	strlcpy(info->driver, tun->info.driver, sizeof(info->driver))
+	strlcpy(info->driver, tun->info.driver, sizeof(info->driver));
 	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
 	strlcpy(info->bus_info, tun->info.bus, sizeof(info->bus_info));
 }
