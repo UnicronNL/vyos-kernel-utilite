@@ -46,6 +46,7 @@ struct ip_tunnel {
 	struct ip_tunnel __rcu	*next;
 	struct hlist_node hash_node;
 	struct net_device	*dev;
+	struct hlist_node link_node;
 	struct net		*net;	/* netns for packet i/o */
 
 	int		err_count;	/* Number of arrived ICMP errors */
@@ -70,6 +71,12 @@ struct ip_tunnel {
 	unsigned int		prl_count;	/* # of entries in PRL */
 	int			ip_tnl_net_id;
 	struct gro_cells	gro_cells;
+
+	/* Vyatta extensions for GRE */
+	uint32_t                 speed;
+	uint8_t                  duplex;
+	struct rtnl_link_stats64 *link_stats;
+	struct ip_tunnel_info    info;
 };
 
 #define TUNNEL_CSUM	__cpu_to_be16(0x01)

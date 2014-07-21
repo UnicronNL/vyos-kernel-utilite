@@ -5,6 +5,7 @@
 #include <linux/pim.h>
 #include <net/sock.h>
 #include <uapi/linux/mroute.h>
+#include <uapi/linux/rtnetlink.h>
 
 #ifdef CONFIG_IP_MROUTE
 static inline int ip_mroute_opt(int opt)
@@ -83,6 +84,7 @@ struct mfc_cache {
 			unsigned long bytes;
 			unsigned long pkt;
 			unsigned long wrong_if;
+			struct rta_mfc_stats dp_stat;
 			unsigned char ttls[MAXVIFS];	/* TTL thresholds		*/
 		} res;
 	} mfc_un;

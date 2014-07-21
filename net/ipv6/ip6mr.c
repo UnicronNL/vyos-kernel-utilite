@@ -1849,6 +1849,8 @@ int ip6_mroute_getsockopt(struct sock *sk, int optname, char __user *optval,
 
 int ip6mr_ioctl(struct sock *sk, int cmd, void __user *arg)
 {
+	bool found;
+	int line;
 	struct sioc_sg_req6 sr;
 	struct sioc_mif_req6 vr;
 	struct mif_device *vif;
@@ -1881,6 +1883,33 @@ int ip6mr_ioctl(struct sock *sk, int cmd, void __user *arg)
 		}
 		read_unlock(&mrt_lock);
 		return -EADDRNOTAVAIL;
+	case SIOCSETSGCNT_IN6:
+		if (copy_from_user(&sr, arg, sizeof(sr)))
+			return -EFAULT;
+
+		rtnl_lock();
+		line = MFC6_HASH(&sr.grp.sin6_addr,
+				 &sr.src.sin6_addr);
+
+		list_for_each_entry(c, &mrt->mfc6_cache_array[line], list) {
+			if (ipv6_addr_equal(&c->mf6c_origin, &sr.src.sin6_addr)
+			   && ipv6_addr_equal(&c->mf6c_mcastgrp, 
+			   &sr.grp.sin6_addr)) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			rtnl_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		write_lock_bh(&mrt_lock);
+		c->mfc_un.res.dp_stat.mfcs_packets = sr.pktcnt;
+		c->mfc_un.res.dp_stat.mfcs_bytes = sr.bytecnt;
+		c->mfc_un.res.dp_stat.mfcs_wrong_if = sr.wrong_if;
+		write_unlock_bh(&mrt_lock);
+		rtnl_unlock();
+		return 0;
 	case SIOCGETSGCNT_IN6:
 		if (copy_from_user(&sr, arg, sizeof(sr)))
 			return -EFAULT;
@@ -1888,9 +1917,12 @@ int ip6mr_ioctl(struct sock *sk, int cmd, void __user *arg)
 		read_lock(&mrt_lock);
 		c = ip6mr_cache_find(mrt, &sr.src.sin6_addr, &sr.grp.sin6_addr);
 		if (c) {
-			sr.pktcnt = c->mfc_un.res.pkt;
-			sr.bytecnt = c->mfc_un.res.bytes;
-			sr.wrong_if = c->mfc_un.res.wrong_if;
+			sr.pktcnt = c->mfc_un.res.pkt + 
+					c->mfc_un.res.dp_stat.mfcs_packets;
+			sr.bytecnt = c->mfc_un.res.bytes +
+					c->mfc_un.res.dp_stat.mfcs_bytes;
+			sr.wrong_if = c->mfc_un.res.wrong_if +
+					c->mfc_un.res.dp_stat.mfcs_wrong_if;
 			read_unlock(&mrt_lock);
 
 			if (copy_to_user(arg, &sr, sizeof(sr)))
@@ -1923,6 +1955,8 @@ struct compat_sioc_mif_req6 {
 
 int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 {
+	bool found;
+	int line;
 	struct compat_sioc_sg_req6 sr;
 	struct compat_sioc_mif_req6 vr;
 	struct mif_device *vif;
@@ -1955,6 +1989,33 @@ int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 		}
 		read_unlock(&mrt_lock);
 		return -EADDRNOTAVAIL;
+	case SIOCSETSGCNT_IN6:
+		if (copy_from_user(&sr, arg, sizeof(sr)))
+			return -EFAULT;
+
+		rtnl_lock();
+		line = MFC6_HASH(&sr.grp.sin6_addr,
+				 &sr.src.sin6_addr);
+
+		list_for_each_entry(c, &mrt->mfc6_cache_array[line], list) {
+			if (ipv6_addr_equal(&c->mf6c_origin, &sr.src.sin6_addr)
+			   && ipv6_addr_equal(&c->mf6c_mcastgrp, 
+			   &sr.grp.sin6_addr)) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			rtnl_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		write_lock_bh(&mrt_lock);
+		c->mfc_un.res.dp_stat.mfcs_packets = sr.pktcnt;
+		c->mfc_un.res.dp_stat.mfcs_bytes = sr.bytecnt;
+		c->mfc_un.res.dp_stat.mfcs_wrong_if = sr.wrong_if;
+		write_unlock_bh(&mrt_lock);
+		rtnl_unlock();
+		return 0;
 	case SIOCGETSGCNT_IN6:
 		if (copy_from_user(&sr, arg, sizeof(sr)))
 			return -EFAULT;
@@ -1962,9 +2023,12 @@ int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 		read_lock(&mrt_lock);
 		c = ip6mr_cache_find(mrt, &sr.src.sin6_addr, &sr.grp.sin6_addr);
 		if (c) {
-			sr.pktcnt = c->mfc_un.res.pkt;
-			sr.bytecnt = c->mfc_un.res.bytes;
-			sr.wrong_if = c->mfc_un.res.wrong_if;
+			sr.pktcnt = c->mfc_un.res.pkt + 
+					c->mfc_un.res.dp_stat.mfcs_packets;
+			sr.bytecnt = c->mfc_un.res.bytes +
+					c->mfc_un.res.dp_stat.mfcs_bytes;
+			sr.wrong_if = c->mfc_un.res.wrong_if +
+					c->mfc_un.res.dp_stat.mfcs_wrong_if;
 			read_unlock(&mrt_lock);
 
 			if (copy_to_user(arg, &sr, sizeof(sr)))

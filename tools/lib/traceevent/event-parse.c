@@ -121,13 +121,7 @@ void pevent_buffer_init(const char *buf, unsigned long long size)
 	init_input_buf(buf, size);
 }
 
-void breakpoint(void)
-{
-	static int x;
-	x++;
-}
-
-struct print_arg *alloc_arg(void)
+static struct print_arg *alloc_arg(void)
 {
 	return calloc(1, sizeof(struct print_arg));
 }
@@ -1271,7 +1265,7 @@ static unsigned int type_size(const char *name)
 		{ "s32",  4 },
 		{ "s64",  8 },
 		{ "char", 1 },
-		{ },
+		{ NULL },
 	};
 	int i;
 
@@ -1547,8 +1541,8 @@ static int event_read_fields(struct event_format *event, struct format_field **f
 				field->elementsize = 1;
 			else if (field->flags & FIELD_IS_LONG)
 				field->elementsize = event->pevent ?
-						     event->pevent->long_size :
-						     sizeof(long);
+                                        (unsigned) event->pevent->long_size :
+                                        sizeof(long);
 		} else
 			field->elementsize = field->size;
 
@@ -2298,8 +2292,7 @@ static char *arg_eval (struct print_arg *arg)
 
 	case PRINT_NULL:
 	case PRINT_FIELD ... PRINT_SYMBOL:
-	case PRINT_STRING:
-	case PRINT_BSTRING:
+	case PRINT_STRING ... PRINT_DYNAMIC_ARRAY:
 	case PRINT_BITMASK:
 	default:
 		do_warning("invalid eval type %d", arg->type);
@@ -4950,6 +4943,8 @@ static void print_args(struct print_arg *args)
 		if (print_paren)
 			printf(")");
 		break;
+        case PRINT_FUNC:
+        case PRINT_DYNAMIC_ARRAY:
 	default:
 		/* we should warn... */
 		return;
@@ -5159,9 +5154,11 @@ static int find_event_handle(struct pevent *pevent, struct event_format *event)
  *
  * /sys/kernel/debug/tracing/events/.../.../format
  */
-enum pevent_errno __pevent_parse_format(struct event_format **eventp,
-					struct pevent *pevent, const char *buf,
-					unsigned long size, const char *sys)
+static enum pevent_errno __pevent_parse_format(struct event_format **eventp,
+                                              struct pevent *pevent,
+                                              const char *buf,
+                                              unsigned long size,
+                                              const char *sys)
 {
 	struct event_format *event;
 	int ret;
@@ -5372,9 +5369,9 @@ int pevent_strerror(struct pevent *pevent __maybe_unused,
 	return 0;
 }
 
-int get_field_val(struct trace_seq *s, struct format_field *field,
-		  const char *name, struct pevent_record *record,
-		  unsigned long long *val, int err)
+static int get_field_val(struct trace_seq *s, struct format_field *field,
+                        const char *name, struct pevent_record *record,
+                        unsigned long long *val, int err)
 {
 	if (!field) {
 		if (err)

@@ -1481,6 +1481,8 @@ int ip_mroute_getsockopt(struct sock *sk, int optname, char __user *optval, int 
 
 int ipmr_ioctl(struct sock *sk, int cmd, void __user *arg)
 {
+	bool found = false;
+	int line;
 	struct sioc_sg_req sr;
 	struct sioc_vif_req vr;
 	struct vif_device *vif;
@@ -1513,6 +1515,31 @@ int ipmr_ioctl(struct sock *sk, int cmd, void __user *arg)
 		}
 		read_unlock(&mrt_lock);
 		return -EADDRNOTAVAIL;
+	case SIOCSETSGCNT:
+		if (copy_from_user(&sr, arg, sizeof(sr)))
+			return -EFAULT;
+
+		rtnl_lock();
+		line = MFC_HASH(sr.grp.s_addr, sr.src.s_addr);
+
+		list_for_each_entry(c, &mrt->mfc_cache_array[line], list) {
+			if (c->mfc_origin == sr.src.s_addr &&
+			    c->mfc_mcastgrp == sr.grp.s_addr) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			rtnl_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		write_lock_bh(&mrt_lock);
+		c->mfc_un.res.dp_stat.mfcs_packets = sr.pktcnt;
+		c->mfc_un.res.dp_stat.mfcs_bytes = sr.bytecnt;
+		c->mfc_un.res.dp_stat.mfcs_wrong_if = sr.wrong_if;
+		write_unlock_bh(&mrt_lock);
+		rtnl_unlock();
+		return 0;
 	case SIOCGETSGCNT:
 		if (copy_from_user(&sr, arg, sizeof(sr)))
 			return -EFAULT;
@@ -1520,9 +1547,12 @@ int ipmr_ioctl(struct sock *sk, int cmd, void __user *arg)
 		rcu_read_lock();
 		c = ipmr_cache_find(mrt, sr.src.s_addr, sr.grp.s_addr);
 		if (c) {
-			sr.pktcnt = c->mfc_un.res.pkt;
-			sr.bytecnt = c->mfc_un.res.bytes;
-			sr.wrong_if = c->mfc_un.res.wrong_if;
+			sr.pktcnt = c->mfc_un.res.pkt + 
+					c->mfc_un.res.dp_stat.mfcs_packets;
+			sr.bytecnt = c->mfc_un.res.bytes +
+					c->mfc_un.res.dp_stat.mfcs_bytes;
+			sr.wrong_if = c->mfc_un.res.wrong_if + 
+					c->mfc_un.res.dp_stat.mfcs_wrong_if;
 			rcu_read_unlock();
 
 			if (copy_to_user(arg, &sr, sizeof(sr)))
@@ -1555,6 +1585,8 @@ struct compat_sioc_vif_req {
 
 int ipmr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 {
+	bool found = false;
+	int line;
 	struct compat_sioc_sg_req sr;
 	struct compat_sioc_vif_req vr;
 	struct vif_device *vif;
@@ -1587,6 +1619,31 @@ int ipmr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 		}
 		read_unlock(&mrt_lock);
 		return -EADDRNOTAVAIL;
+	case SIOCSETSGCNT:
+		if (copy_from_user(&sr, arg, sizeof(sr)))
+                       return -EFAULT;
+
+		rtnl_lock();
+		line = MFC_HASH(sr.grp.s_addr, sr.src.s_addr);
+
+		list_for_each_entry(c, &mrt->mfc_cache_array[line], list) {
+			if (c->mfc_origin == sr.src.s_addr &&
+			    c->mfc_mcastgrp == sr.grp.s_addr) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			rtnl_unlock();
+			return -EADDRNOTAVAIL;
+		}
+		write_lock_bh(&mrt_lock);
+		c->mfc_un.res.dp_stat.mfcs_packets = sr.pktcnt;
+		c->mfc_un.res.dp_stat.mfcs_bytes = sr.bytecnt;
+		c->mfc_un.res.dp_stat.mfcs_wrong_if = sr.wrong_if;
+		write_unlock_bh(&mrt_lock);
+		rtnl_unlock();
+		return 0;
 	case SIOCGETSGCNT:
 		if (copy_from_user(&sr, arg, sizeof(sr)))
 			return -EFAULT;
@@ -1594,9 +1651,12 @@ int ipmr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 		rcu_read_lock();
 		c = ipmr_cache_find(mrt, sr.src.s_addr, sr.grp.s_addr);
 		if (c) {
-			sr.pktcnt = c->mfc_un.res.pkt;
-			sr.bytecnt = c->mfc_un.res.bytes;
-			sr.wrong_if = c->mfc_un.res.wrong_if;
+			sr.pktcnt = c->mfc_un.res.pkt + 
+					c->mfc_un.res.dp_stat.mfcs_packets;
+			sr.bytecnt = c->mfc_un.res.bytes + 
+					c->mfc_un.res.dp_stat.mfcs_bytes;
+			sr.wrong_if = c->mfc_un.res.wrong_if + 
+					c->mfc_un.res.dp_stat.mfcs_wrong_if;
 			rcu_read_unlock();
 
 			if (copy_to_user(arg, &sr, sizeof(sr)))

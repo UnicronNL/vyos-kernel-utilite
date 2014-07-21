@@ -6,6 +6,7 @@
 #include <linux/skbuff.h>	/* for struct sk_buff_head */
 #include <net/net_namespace.h>
 #include <uapi/linux/mroute6.h>
+#include <uapi/linux/rtnetlink.h>
 
 #ifdef CONFIG_IPV6_MROUTE
 static inline int ip6_mroute_opt(int opt)
@@ -93,6 +94,7 @@ struct mfc6_cache {
 			unsigned long pkt;
 			unsigned long wrong_if;
 			unsigned char ttls[MAXMIFS];	/* TTL thresholds		*/
+			struct rta_mfc_stats dp_stat;
 		} res;
 	} mfc_un;
 };

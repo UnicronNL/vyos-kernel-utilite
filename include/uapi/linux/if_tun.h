@@ -37,6 +37,9 @@
 #define TUN_VNET_HDR 	0x0200
 #define TUN_TAP_MQ      0x0400
 
+/* Vyatta specific addition */
+#define TUN_META_HDR   0x8000
+
 /* Ioctl defines */
 #define TUNSETNOCSUM  _IOW('T', 200, int) 
 #define TUNSETDEBUG   _IOW('T', 201, int) 
@@ -59,9 +62,13 @@
 #define TUNSETIFINDEX	_IOW('T', 218, unsigned int)
 #define TUNGETFILTER _IOR('T', 219, struct sock_fprog)
 
+/* Vyatta specific addition */
+#define TUNGETMETAPARAM _IOW('T', 300, int)
+
 /* TUNSETIFF ifr flags */
 #define IFF_TUN		0x0001
 #define IFF_TAP		0x0002
+#define IFF_META_HDR   0x0010  /* Vyatta */
 #define IFF_NO_PI	0x1000
 /* This flag has no real effect */
 #define IFF_ONE_QUEUE	0x2000
@@ -105,5 +112,14 @@ struct tun_filter {
 	__u16  count; /* Number of addresses */
 	__u8   addr[0][ETH_ALEN];
 };
+
+/* Meta data info prepended to packets (when IFF_META_HDR is set) */
+#define TUN_META_FLAG_MARK  0x0001
+#define TUN_META_FLAG_IIF   0x0002
+struct tun_meta {
+	__u16   flags;
+	__u32   mark;
+	__u32   iif;
+} __attribute__ ((__packed__));
 
 #endif /* _UAPI__IF_TUN_H */

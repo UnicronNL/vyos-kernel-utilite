@@ -33,6 +33,7 @@
 #define SIOCGETVIFCNT	SIOCPROTOPRIVATE	/* IP protocol privates */
 #define SIOCGETSGCNT	(SIOCPROTOPRIVATE+1)
 #define SIOCGETRPF	(SIOCPROTOPRIVATE+2)
+#define SIOCSETSGCNT   (SIOCPROTOPRIVATE+3)
 
 #define MAXVIFS		32	
 typedef unsigned long vifbitmap_t;	/* User mode code depends on this lot */

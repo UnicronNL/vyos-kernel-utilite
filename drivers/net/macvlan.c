@@ -218,6 +218,7 @@ static void macvlan_process_broadcast(struct work_struct *w)
 					  MACVLAN_MODE_PRIVATE |
 					  MACVLAN_MODE_VEPA    |
 					  MACVLAN_MODE_PASSTHRU|
+					  MACVLAN_MODE_VRRP    |
 					  MACVLAN_MODE_BRIDGE);
 		else if (src->mode == MACVLAN_MODE_VEPA)
 			/* flood to everyone except source */
@@ -290,6 +291,11 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 		    src->mode != MACVLAN_MODE_BRIDGE) {
 			/* forward to original port. */
 			vlan = src;
+                        if (vlan->mode == MACVLAN_MODE_VRRP) {
+                                skb->dev = vlan->lowerdev;
+                                skb->pkt_type = PACKET_MULTICAST;
+                                return RX_HANDLER_PASS;
+                        }
 			ret = macvlan_broadcast_one(skb, vlan, eth, 0) ?:
 			      netif_rx(skb);
 			goto out;
@@ -308,6 +314,12 @@ static rx_handler_result_t macvlan_handle_frame(struct sk_buff **pskb)
 		vlan = macvlan_hash_lookup(port, eth->h_dest);
 	if (vlan == NULL)
 		return RX_HANDLER_PASS;
+
+        if (vlan->mode == MACVLAN_MODE_VRRP) {
+                skb->dev = vlan->lowerdev;
+                skb->pkt_type = PACKET_HOST;
+                return RX_HANDLER_PASS;
+        }
 
 	dev = vlan->dev;
 	if (unlikely(!(dev->flags & IFF_UP))) {
@@ -957,6 +969,7 @@ static int macvlan_validate(struct nlattr *tb[], struct nlattr *data[])
 		case MACVLAN_MODE_VEPA:
 		case MACVLAN_MODE_BRIDGE:
 		case MACVLAN_MODE_PASSTHRU:
+		case MACVLAN_MODE_VRRP:
 			break;
 		default:
 			return -EINVAL;

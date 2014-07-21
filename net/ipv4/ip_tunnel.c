@@ -62,6 +62,11 @@
 #include <net/ip6_route.h>
 #endif
 
+static int tunnels_net_id;
+struct tunnels_net {
+	struct hlist_head link_map[IP_TNL_HASH_SIZE];
+};
+
 static unsigned int ip_tunnel_hash(__be32 key, __be32 remote)
 {
 	return hash_32((__force u32)key ^ (__force u32)remote,
@@ -259,7 +264,61 @@ static void ip_tunnel_add(struct ip_tunnel_net *itn, struct ip_tunnel *t)
 static void ip_tunnel_del(struct ip_tunnel *t)
 {
 	hlist_del_init_rcu(&t->hash_node);
+	hlist_del_init(&t->link_node);
 }
+
+static void ip_tunnel_add_link(struct net *net, struct ip_tunnel *t, int iflink)
+{
+	struct tunnels_net *tn = net_generic(net, tunnels_net_id);
+	int hash = hash_32(iflink, IP_TNL_HASH_BITS);
+
+	hlist_add_head(&t->link_node, &tn->link_map[hash]);
+}
+
+static int ip_tunnel_notify(struct notifier_block *unused,
+			    unsigned long event, void *ptr)
+{
+	struct net_device *rootdev = ptr;
+	struct tunnels_net *tn = net_generic(dev_net(rootdev), tunnels_net_id);
+	int hash = hash_32(rootdev->iflink, IP_TNL_HASH_BITS);
+	struct hlist_node *n;
+	struct ip_tunnel *t;
+
+	hlist_for_each_entry_safe(t, n, &tn->link_map[hash], link_node) {
+		int flags;
+
+		if (rootdev->ifindex != t->dev->iflink)
+			continue;
+
+		switch (event) {
+		case NETDEV_CHANGE:
+			break;
+
+		case NETDEV_DOWN:
+			flags = t->dev->flags;
+			if (!(flags & IFF_UP))
+				break;
+			dev_change_flags(t->dev, flags & ~IFF_UP);
+			break;
+
+		case NETDEV_UP:
+			flags = t->dev->flags;
+			if (flags & IFF_UP)
+				break;
+			dev_change_flags(t->dev, flags | IFF_UP);
+			break;
+
+		default:
+			continue;
+		}
+		netif_stacked_transfer_operstate(rootdev, t->dev);
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block ip_tunnel_notifier = {
+	.notifier_call = ip_tunnel_notify,
+};
 
 static struct ip_tunnel *ip_tunnel_find(struct ip_tunnel_net *itn,
 					struct ip_tunnel_parm *parms,
@@ -322,6 +381,7 @@ static struct net_device *__ip_tunnel_create(struct net *net,
 	if (err)
 		goto failed_free;
 
+	linkwatch_fire_event(dev);	/* call rfc2863_policy */
 	return dev;
 
 failed_free:
@@ -344,7 +404,7 @@ static inline void init_tunnel_flow(struct flowi4 *fl4,
 	fl4->fl4_gre_key = key;
 }
 
-static int ip_tunnel_bind_dev(struct net_device *dev)
+static int ip_tunnel_bind_dev(struct ip_tunnel_net *itn, struct net_device *dev)
 {
 	struct net_device *tdev = NULL;
 	struct ip_tunnel *tunnel = netdev_priv(dev);
@@ -380,8 +440,12 @@ static int ip_tunnel_bind_dev(struct net_device *dev)
 	if (tdev) {
 		hlen = tdev->hard_header_len + tdev->needed_headroom;
 		mtu = tdev->mtu;
+		netif_stacked_transfer_operstate(tdev, dev);
+		ip_tunnel_add_link(dev_net(dev), tunnel, tdev->ifindex);
+		dev->iflink = tdev->ifindex;
+	} else {
+		dev->iflink = tunnel->parms.link;
 	}
-	dev->iflink = tunnel->parms.link;
 
 	dev->needed_headroom = t_hlen + hlen;
 	mtu -= (dev->hard_header_len + t_hlen);
@@ -404,7 +468,7 @@ static struct ip_tunnel *ip_tunnel_create(struct net *net,
 	if (IS_ERR(dev))
 		return ERR_CAST(dev);
 
-	dev->mtu = ip_tunnel_bind_dev(dev);
+	dev->mtu = ip_tunnel_bind_dev(itn, dev);
 
 	nt = netdev_priv(dev);
 	ip_tunnel_add(itn, nt);
@@ -715,7 +779,7 @@ static void ip_tunnel_update(struct ip_tunnel_net *itn,
 		int mtu;
 
 		t->parms.link = p->link;
-		mtu = ip_tunnel_bind_dev(dev);
+		mtu = ip_tunnel_bind_dev(itn, dev);
 		if (set_mtu)
 			dev->mtu = mtu;
 	}
@@ -838,6 +902,7 @@ static void ip_tunnel_dev_free(struct net_device *dev)
 {
 	struct ip_tunnel *tunnel = netdev_priv(dev);
 
+	kfree(tunnel->link_stats);
 	gro_cells_destroy(&tunnel->gro_cells);
 	free_percpu(tunnel->dst_cache);
 	free_percpu(dev->tstats);
@@ -953,12 +1018,12 @@ int ip_tunnel_newlink(struct net_device *dev, struct nlattr *tb[],
 	if (dev->type == ARPHRD_ETHER && !tb[IFLA_ADDRESS])
 		eth_hw_addr_random(dev);
 
-	mtu = ip_tunnel_bind_dev(dev);
+	mtu = ip_tunnel_bind_dev(itn, dev);
 	if (!tb[IFLA_MTU])
 		dev->mtu = mtu;
 
 	ip_tunnel_add(itn, nt);
-
+	linkwatch_fire_event(dev);
 out:
 	return err;
 }
@@ -1059,4 +1124,44 @@ void ip_tunnel_setup(struct net_device *dev, int net_id)
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_setup);
 
+static int __net_init tunnels_init_net(struct net *net)
+{
+	struct tunnels_net *tn = net_generic(net, tunnels_net_id);
+	unsigned i;
+
+	for (i = 0; i < IP_TNL_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&tn->link_map[i]);
+
+	return 0;
+}
+
+static struct pernet_operations tunnels_net_ops = {
+	.init = tunnels_init_net,
+	.id   = &tunnels_net_id,
+	.size = sizeof(struct tunnels_net),
+};
+
+static int __init ip_tunnel_mod_init(void)
+{
+	int err;
+
+	err = register_pernet_device(&tunnels_net_ops);
+	if (err < 0)
+		return err;
+
+	err = register_netdevice_notifier(&ip_tunnel_notifier);
+	if (err < 0)
+		unregister_pernet_device(&tunnels_net_ops);
+
+	return err;
+}
+
+static void __exit ip_tunnel_mod_fini(void)
+{
+	unregister_netdevice_notifier(&ip_tunnel_notifier);
+	unregister_pernet_device(&tunnels_net_ops);
+}
+
+module_init(ip_tunnel_mod_init);
+module_exit(ip_tunnel_mod_fini);
 MODULE_LICENSE("GPL");

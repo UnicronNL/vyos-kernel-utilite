@@ -60,6 +60,7 @@
 #include <linux/if_arp.h>
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
+#include <linux/if_tunnel.h>
 #include <linux/if_vlan.h>
 #include <linux/crc32.h>
 #include <linux/nsproxy.h>
@@ -193,6 +194,12 @@ struct tun_struct {
 	struct list_head disabled;
 	void *security;
 	u32 flow_count;
+
+        /* Vyatta extensions for remote statistics and speed */
+        uint8_t                 duplex;
+        uint32_t                speed;
+        struct rtnl_link_stats64 *link_stats;
+        struct ip_tunnel_info   info;
 };
 
 static inline u32 tun_hashfn(u32 rxhash)
@@ -848,6 +855,94 @@ static netdev_features_t tun_net_fix_features(struct net_device *dev,
 
 	return (features & tun->set_features) | (features & ~TUN_USER_FEATURES);
 }
+
+/* Vyatta extension to allow an ioctl to set interface statistics */
+static int
+tun_net_set_stats(struct net_device *dev, const void __user *data)
+{
+	struct tun_struct *tun = netdev_priv(dev);
+	struct link_stats_rcu {
+		struct rtnl_link_stats64 link;
+		struct rcu_head rcu;
+	} *stats;
+	struct rtnl_link_stats64 *old;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	stats = kmalloc(sizeof(*stats), GFP_USER);
+	if (!stats)
+		return -ENOMEM;
+
+	if (copy_from_user(&stats->link, data,
+			   sizeof(struct rtnl_link_stats64))) {
+		kfree(stats);
+		return -EFAULT;
+	}
+
+	old = xchg(&tun->link_stats, &stats->link);
+	if (old)
+		kfree_rcu(container_of(old, struct link_stats_rcu, link),
+			  rcu);
+
+	return 0;
+}
+
+static int
+tun_net_set_info(struct net_device *dev, const void __user *data)
+{
+	struct tun_struct *tun = netdev_priv(dev);
+	struct ip_tunnel_info info;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (copy_from_user(&info, data, sizeof(info)))
+		return -EFAULT;
+
+	strlcpy(tun->info.driver, info.driver, sizeof(tun->info.driver));
+	strlcpy(tun->info.bus, info.bus, sizeof(tun->info.bus));
+	return 0;
+}
+
+static int
+tun_net_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	switch(cmd) {
+	case SIOCTUNNELSTATS:
+		return tun_net_set_stats(dev, ifr->ifr_ifru.ifru_data);
+	case SIOCTUNNELINFO:
+		return tun_net_set_info(dev, ifr->ifr_ifru.ifru_data);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static struct rtnl_link_stats64 *
+tun_net_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *storage)
+{
+	struct tun_struct *tun = netdev_priv(dev);
+	struct rtnl_link_stats64 *stats;
+
+	rcu_read_lock();
+	stats = rcu_dereference(tun->link_stats);
+	if (stats) {
+		/* Stats received from device */
+		*storage = *stats;
+		rcu_read_unlock();
+
+		/* Add tunnel detected errors to mix */
+		storage->tx_dropped += dev->stats.tx_dropped;
+		storage->rx_dropped += dev->stats.rx_dropped;
+		storage->rx_frame_errors += dev->stats.rx_frame_errors;
+		return storage;
+	}
+	rcu_read_unlock();
+
+	netdev_stats_to_stats64(storage, &dev->stats);
+	return storage;
+}
+
 #ifdef CONFIG_NET_POLL_CONTROLLER
 static void tun_poll_controller(struct net_device *dev)
 {
@@ -886,6 +981,8 @@ static const struct net_device_ops tap_netdev_ops = {
 	.ndo_change_mtu		= tun_net_change_mtu,
 	.ndo_fix_features	= tun_net_fix_features,
 	.ndo_set_rx_mode	= tun_net_mclist,
+	.ndo_get_stats64	= tun_net_get_stats64,
+	.ndo_do_ioctl		= tun_net_ioctl,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_select_queue	= tun_select_queue,
@@ -1023,6 +1120,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	bool zerocopy = false;
 	int err;
 	u32 rxhash;
+	struct tun_meta meta = { .flags = 0 };
 
 	if (!(tun->flags & TUN_NO_PI)) {
 		if (len < sizeof(pi))
@@ -1049,6 +1147,16 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 		if (gso.hdr_len > len)
 			return -EINVAL;
 		offset += tun->vnet_hdr_sz;
+	}
+
+	if (tun->flags & TUN_META_HDR) {
+		if ((len -= sizeof(meta)) > total_len)
+			return -EINVAL;
+
+		if (memcpy_fromiovecend((void *)&meta, iv, offset,
+		    sizeof(meta)))
+			return -EFAULT;
+		offset += sizeof(meta);
 	}
 
 	if ((tun->flags & TUN_TYPE_MASK) == TUN_TAP_DEV) {
@@ -1183,6 +1291,10 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 	skb_probe_transport_header(skb, 0);
 
 	rxhash = skb_get_hash(skb);
+
+	if (meta.flags & TUN_META_FLAG_MARK)
+		skb->mark = meta.mark;
+
 	netif_rx_ni(skb);
 
 	tun->dev->stats.rx_packets++;
@@ -1282,6 +1394,24 @@ static ssize_t tun_put_user(struct tun_struct *tun,
 					       sizeof(gso))))
 			return -EFAULT;
 		total += tun->vnet_hdr_sz;
+	}
+
+	if (tun->flags & TUN_META_HDR) {
+		struct tun_meta meta = { 0 };	/* no info leak */
+
+		if ((len -= sizeof(meta)) < 0)
+			return -EINVAL;
+
+		meta.flags = TUN_META_FLAG_IIF;
+		meta.iif = skb->skb_iif;
+
+		meta.flags |= TUN_META_FLAG_MARK;
+		meta.mark = skb->mark;
+
+		if (unlikely(memcpy_toiovecend(iv, (void *)&meta, 0,
+					       sizeof(meta))))
+			return -EFAULT;
+		total += sizeof(meta);
 	}
 
 	copied = total;
@@ -1387,6 +1517,7 @@ static void tun_free_netdev(struct net_device *dev)
 	tun_flow_uninit(tun);
 	security_tun_dev_free_security(tun->security);
 	free_netdev(dev);
+	kfree(tun->link_stats);
 }
 
 static void tun_setup(struct net_device *dev)
@@ -1395,6 +1526,8 @@ static void tun_setup(struct net_device *dev)
 
 	tun->owner = INVALID_UID;
 	tun->group = INVALID_GID;
+	tun->speed = SPEED_UNKNOWN;
+	tun->duplex = DUPLEX_UNKNOWN;
 
 	dev->ethtool_ops = &tun_ethtool_ops;
 	dev->destructor = tun_free_netdev;
@@ -1525,6 +1658,9 @@ static int tun_flags(struct tun_struct *tun)
 	if (tun->flags & TUN_TAP_MQ)
 		flags |= IFF_MULTI_QUEUE;
 
+	if (tun->flags & TUN_META_HDR)
+		flags |= IFF_META_HDR;
+
 	if (tun->flags & TUN_PERSIST)
 		flags |= IFF_PERSIST;
 
@@ -1653,6 +1789,11 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 
 		spin_lock_init(&tun->lock);
 
+		strlcpy(tun->info.driver, DRV_NAME, sizeof(tun->info.driver));
+		strlcpy(tun->info.bus,
+			(ifr->ifr_flags & IFF_TUN) ? "tun" : "tap",
+			sizeof(tun->info.bus));
+
 		err = security_tun_dev_alloc_security(&tun->security);
 		if (err < 0)
 			goto err_free_dev;
@@ -1709,6 +1850,11 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 		tun->flags |= TUN_TAP_MQ;
 	else
 		tun->flags &= ~TUN_TAP_MQ;
+
+	if (ifr->ifr_flags & IFF_META_HDR)
+		tun->flags |= TUN_META_HDR;
+	else
+		tun->flags &= ~TUN_META_HDR;
 
 	/* Make sure persistent devices do not get stuck in
 	 * xoff state.
@@ -2263,14 +2409,27 @@ static int tun_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 {
 	cmd->supported		= 0;
 	cmd->advertising	= 0;
-	ethtool_cmd_speed_set(cmd, SPEED_10);
-	cmd->duplex		= DUPLEX_FULL;
+	ethtool_cmd_speed_set(cmd, tun->speed);
+	cmd->duplex		= tun->duplex;
 	cmd->port		= PORT_TP;
 	cmd->phy_address	= 0;
 	cmd->transceiver	= XCVR_INTERNAL;
-	cmd->autoneg		= AUTONEG_DISABLE;
+	cmd->autoneg		= AUTONEG_ENABLE;
 	cmd->maxtxpkt		= 0;
 	cmd->maxrxpkt		= 0;
+	return 0;
+}
+
+static int tun_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct tun_struct *tun = netdev_priv(dev);
+
+	if (ecmd->autoneg != AUTONEG_ENABLE)
+		return -EOPNOTSUPP;
+
+	tun->speed = ethtool_cmd_speed(ecmd);
+	tun->duplex = ecmd->duplex;
+
 	return 0;
 }
 
@@ -2278,17 +2437,9 @@ static void tun_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info
 {
 	struct tun_struct *tun = netdev_priv(dev);
 
-	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strlcpy(info->driver, tun->info.driver, sizeof(info->driver))
 	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
-
-	switch (tun->flags & TUN_TYPE_MASK) {
-	case TUN_TUN_DEV:
-		strlcpy(info->bus_info, "tun", sizeof(info->bus_info));
-		break;
-	case TUN_TAP_DEV:
-		strlcpy(info->bus_info, "tap", sizeof(info->bus_info));
-		break;
-	}
+	strlcpy(info->bus_info, tun->info.bus, sizeof(info->bus_info));
 }
 
 static u32 tun_get_msglevel(struct net_device *dev)
@@ -2311,6 +2462,7 @@ static void tun_set_msglevel(struct net_device *dev, u32 value)
 
 static const struct ethtool_ops tun_ethtool_ops = {
 	.get_settings	= tun_get_settings,
+	.set_settings	= tun_set_settings,
 	.get_drvinfo	= tun_get_drvinfo,
 	.get_msglevel	= tun_get_msglevel,
 	.set_msglevel	= tun_set_msglevel,

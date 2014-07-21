@@ -25,14 +25,20 @@
 
 #define __weak __attribute__((weak))
 
-void __vwarning(const char *fmt, va_list ap)
+#include "event-utils.h"
+
+void __vwarning(const char *fmt, ...)
 {
+        va_list ap;
+
 	if (errno)
 		perror("trace-cmd");
 	errno = 0;
 
 	fprintf(stderr, "  ");
+	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
+	va_end(ap);
 
 	fprintf(stderr, "\n");
 }
@@ -55,9 +61,13 @@ void __weak warning(const char *fmt, ...)
 	va_end(ap);
 }
 
-void __vpr_stat(const char *fmt, va_list ap)
+void __vpr_stat(const char *fmt, ...)
 {
+        va_list ap;
+
+        va_start(ap, fmt);
 	vprintf(fmt, ap);
+        va_end(ap);
 	printf("\n");
 }
 

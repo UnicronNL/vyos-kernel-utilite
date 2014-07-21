@@ -480,6 +480,10 @@ static void __gre_tunnel_init(struct net_device *dev)
 
 	dev->features		|= GRE_FEATURES;
 	dev->hw_features	|= GRE_FEATURES;
+	dev->priv_flags         |= IFF_LIVE_ADDR_CHANGE;
+
+	strlcpy(tunnel->info.driver, "gre", sizeof(tunnel->info.driver));
+	strlcpy(tunnel->info.bus, "gretap", sizeof(tunnel->info.bus));
 
 	if (!(tunnel->parms.o_flags & TUNNEL_SEQ)) {
 		/* TCP offload with GRE SEQ is not supported. */
@@ -635,14 +639,145 @@ static int gre_tap_init(struct net_device *dev)
 	return ip_tunnel_init(dev);
 }
 
+/* Vyatta extension to allow masquarading of device statistics */
+static struct rtnl_link_stats64 *gre_tap_stats64(struct net_device *dev,
+						 struct rtnl_link_stats64 *tot)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+	struct rtnl_link_stats64 *stats;
+
+	rcu_read_lock();
+	stats = rcu_dereference(t->link_stats);
+	if (stats) {
+		*tot = *stats;
+		rcu_read_unlock();
+		return tot;
+	} else {
+		rcu_read_unlock();
+		return ip_tunnel_get_stats64(dev, tot);
+	}
+}
+
+/* Vyatta extension to allow an ioctl to set interface statistics */
+static int
+gre_tap_set_stats(struct net_device *dev, const void __user *data)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+	struct link_stats_rcu {
+		struct rtnl_link_stats64 link;
+		struct rcu_head rcu;
+	} *stats;
+	struct rtnl_link_stats64 *old;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	stats = kmalloc(sizeof(*stats), GFP_USER);
+	if (!stats)
+		return -ENOMEM;
+
+	if (copy_from_user(&stats->link, data,
+			   sizeof(struct rtnl_link_stats64))) {
+		kfree(stats);
+		return -EFAULT;
+	}
+
+	old = xchg(&t->link_stats, &stats->link);
+	if (old)
+	    kfree_rcu(container_of(old, struct link_stats_rcu, link),
+		      rcu);
+
+	return 0;
+}
+
+static int
+gre_tap_set_info(struct net_device *dev, const void __user *data)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+	struct ip_tunnel_info info;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (copy_from_user(&info, data, sizeof(info)))
+		return -EFAULT;
+
+	strlcpy(t->info.driver, info.driver, sizeof(t->info.driver));
+	strlcpy(t->info.bus, info.bus, sizeof(t->info.bus));
+	return 0;
+}
+
+static int
+gre_tap_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	switch(cmd) {
+	case SIOCTUNNELSTATS:
+		return gre_tap_set_stats(dev, ifr->ifr_ifru.ifru_data);
+	case SIOCTUNNELINFO:
+		return gre_tap_set_info(dev, ifr->ifr_ifru.ifru_data);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static const struct net_device_ops gre_tap_netdev_ops = {
 	.ndo_init		= gre_tap_init,
 	.ndo_uninit		= ip_tunnel_uninit,
 	.ndo_start_xmit		= gre_tap_xmit,
+	.ndo_do_ioctl		= gre_tap_ioctl,
 	.ndo_set_mac_address 	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= ip_tunnel_change_mtu,
-	.ndo_get_stats64	= ip_tunnel_get_stats64,
+	.ndo_get_stats64	= gre_tap_stats64,
+};
+
+
+static int gretap_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+
+	cmd->supported		= 0;
+	cmd->advertising	= 0;
+	ethtool_cmd_speed_set(cmd, t->speed);
+	cmd->duplex		= t->duplex;
+	cmd->port		= PORT_TP;
+	cmd->phy_address	= 0;
+	cmd->transceiver	= XCVR_INTERNAL;
+	cmd->autoneg		= AUTONEG_ENABLE;
+	cmd->maxtxpkt		= 0;
+	cmd->maxrxpkt		= 0;
+	return 0;
+}
+
+static int gretap_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+
+	if (ecmd->autoneg != AUTONEG_ENABLE)
+		return -EOPNOTSUPP;
+
+	t->speed = ethtool_cmd_speed(ecmd);
+	t->duplex = ecmd->duplex;
+
+	return 0;
+}
+
+static void gretap_get_drvinfo(struct net_device *dev,
+			       struct ethtool_drvinfo *info)
+{
+	struct ip_tunnel *t = netdev_priv(dev);
+
+	strlcpy(info->driver, t->info.driver, sizeof(info->driver));
+	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+	strlcpy(info->bus_info, t->info.bus, sizeof(info->bus_info));
+}
+
+
+static const struct ethtool_ops gretap_ethtool_ops = {
+	.get_settings	= gretap_get_settings,
+	.set_settings	= gretap_set_settings,
+	.get_drvinfo	= gretap_get_drvinfo,
+	.get_link	= ethtool_op_get_link,
 };
 
 static void ipgre_tap_setup(struct net_device *dev)
@@ -650,6 +785,7 @@ static void ipgre_tap_setup(struct net_device *dev)
 	ether_setup(dev);
 	dev->netdev_ops		= &gre_tap_netdev_ops;
 	dev->priv_flags 	|= IFF_LIVE_ADDR_CHANGE;
+	dev->ethtool_ops 	= &gretap_ethtool_ops;
 	ip_tunnel_setup(dev, gre_tap_net_id);
 }
 
