@@ -11,6 +11,7 @@
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#define DRV_VERSION "1.0"
 
 #include <linux/capability.h>
 #include <linux/module.h>
