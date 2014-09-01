@@ -1227,7 +1227,7 @@ static struct buffer_head * ext4_find_entry (struct inode *dir,
 				   buffer */
 	int num = 0;
 	ext4_lblk_t  nblocks;
-	int i, err;
+	int i, err = 0;
 	int namelen;
 
 	*res_dir = NULL;
@@ -1264,7 +1264,11 @@ static struct buffer_head * ext4_find_entry (struct inode *dir,
 		 * return.  Otherwise, fall back to doing a search the
 		 * old fashioned way.
 		 */
-		if (bh || (err != ERR_BAD_DX_DIR))
+		if (err == -ENOENT)
+			return NULL;
+		if (err && err != ERR_BAD_DX_DIR)
+			return ERR_PTR(err);
+		if (bh)
 			return bh;
 		dxtrace(printk(KERN_DEBUG "ext4_find_entry: dx failed, "
 			       "falling back\n"));
@@ -1295,6 +1299,11 @@ restart:
 				}
 				num++;
 				bh = ext4_getblk(NULL, dir, b++, 0, &err);
+				if (unlikely(err)) {
+					if (ra_max == 0)
+						return ERR_PTR(err);
+					break;
+				}
 				bh_use[ra_max] = bh;
 				if (bh)
 					ll_rw_block(READ | REQ_META | REQ_PRIO,
@@ -1417,6 +1426,8 @@ static struct dentry *ext4_lookup(struct inode *dir, struct dentry *dentry, unsi
 		return ERR_PTR(-ENAMETOOLONG);
 
 	bh = ext4_find_entry(dir, &dentry->d_name, &de, NULL);
+	if (IS_ERR(bh))
+		return (struct dentry *) bh;
 	inode = NULL;
 	if (bh) {
 		__u32 ino = le32_to_cpu(de->inode);
@@ -1450,6 +1461,8 @@ struct dentry *ext4_get_parent(struct dentry *child)
 	struct buffer_head *bh;
 
 	bh = ext4_find_entry(child->d_inode, &dotdot, &de, NULL);
+	if (IS_ERR(bh))
+		return (struct dentry *) bh;
 	if (!bh)
 		return ERR_PTR(-ENOENT);
 	ino = le32_to_cpu(de->inode);
@@ -2727,6 +2740,8 @@ static int ext4_rmdir(struct inode *dir, struct dentry *dentry)
 
 	retval = -ENOENT;
 	bh = ext4_find_entry(dir, &dentry->d_name, &de, NULL);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
 	if (!bh)
 		goto end_rmdir;
 
@@ -2794,6 +2809,8 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
 
 	retval = -ENOENT;
 	bh = ext4_find_entry(dir, &dentry->d_name, &de, NULL);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
 	if (!bh)
 		goto end_unlink;
 
@@ -3121,6 +3138,8 @@ static int ext4_find_delete_entry(handle_t *handle, struct inode *dir,
 	struct ext4_dir_entry_2 *de;
 
 	bh = ext4_find_entry(dir, d_name, &de, NULL);
+	if (IS_ERR(bh))
+		return PTR_ERR(bh);
 	if (bh) {
 		retval = ext4_delete_entry(handle, dir, de, bh);
 		brelse(bh);
@@ -3128,7 +3147,8 @@ static int ext4_find_delete_entry(handle_t *handle, struct inode *dir,
 	return retval;
 }
 
-static void ext4_rename_delete(handle_t *handle, struct ext4_renament *ent)
+static void ext4_rename_delete(handle_t *handle, struct ext4_renament *ent,
+			       int force_reread)
 {
 	int retval;
 	/*
@@ -3140,7 +3160,8 @@ static void ext4_rename_delete(handle_t *handle, struct ext4_renament *ent)
 	if (le32_to_cpu(ent->de->inode) != ent->inode->i_ino ||
 	    ent->de->name_len != ent->dentry->d_name.len ||
 	    strncmp(ent->de->name, ent->dentry->d_name.name,
-		    ent->de->name_len)) {
+		    ent->de->name_len) ||
+	    force_reread) {
 		retval = ext4_find_delete_entry(handle, ent->dir,
 						&ent->dentry->d_name);
 	} else {
@@ -3169,39 +3190,6 @@ static void ext4_update_dir_count(handle_t *handle, struct ext4_renament *ent)
 	}
 }
 
-static struct inode *ext4_whiteout_for_rename(struct ext4_renament *ent,
-					      int credits, handle_t **h)
-{
-	struct inode *wh;
-	handle_t *handle;
-	int retries = 0;
-
-	/*
-	 * for inode block, sb block, group summaries,
-	 * and inode bitmap
-	 */
-	credits += (EXT4_MAXQUOTAS_TRANS_BLOCKS(ent->dir->i_sb) +
-		    EXT4_XATTR_TRANS_BLOCKS + 4);
-retry:
-	wh = ext4_new_inode_start_handle(ent->dir, S_IFCHR | WHITEOUT_MODE,
-					 &ent->dentry->d_name, 0, NULL,
-					 EXT4_HT_DIR, credits);
-
-	handle = ext4_journal_current_handle();
-	if (IS_ERR(wh)) {
-		if (handle)
-			ext4_journal_stop(handle);
-		if (PTR_ERR(wh) == -ENOSPC &&
-		    ext4_should_retry_alloc(ent->dir->i_sb, &retries))
-			goto retry;
-	} else {
-		*h = handle;
-		init_special_inode(wh, wh->i_mode, WHITEOUT_DEV);
-		wh->i_op = &ext4_special_inode_operations;
-	}
-	return wh;
-}
-
 /*
  * Anybody can rename anything with this: the permission checks are left to the
  * higher-level routines.
@@ -3210,9 +3198,8 @@ retry:
  * while new_{dentry,inode) refers to the destination dentry/inode
  * This comes from rename(const char *oldpath, const char *newpath)
  */
-static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
-			      struct inode *new_dir, struct dentry *new_dentry,
-			      unsigned int flags)
+static int ext4_rename(struct inode *old_dir, struct dentry *old_dentry,
+		       struct inode *new_dir, struct dentry *new_dentry)
 {
 	handle_t *handle = NULL;
 	struct ext4_renament old = {
@@ -3225,10 +3212,8 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 		.dentry = new_dentry,
 		.inode = new_dentry->d_inode,
 	};
+	int force_reread;
 	int retval;
-	struct inode *whiteout = NULL;
-	int credits;
-	u8 old_file_type;
 
 	dquot_initialize(old.dir);
 	dquot_initialize(new.dir);
@@ -3239,6 +3224,8 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 		dquot_initialize(new.inode);
 
 	old.bh = ext4_find_entry(old.dir, &old.dentry->d_name, &old.de, NULL);
+	if (IS_ERR(old.bh))
+		return PTR_ERR(old.bh);
 	/*
 	 *  Check for inode number is _not_ due to possible IO errors.
 	 *  We might rmdir the source, keep it as pwd of some process
@@ -3251,6 +3238,10 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	new.bh = ext4_find_entry(new.dir, &new.dentry->d_name,
 				 &new.de, &new.inlined);
+	if (IS_ERR(new.bh)) {
+		retval = PTR_ERR(new.bh);
+		goto end_rename;
+	}
 	if (new.bh) {
 		if (!new.inode) {
 			brelse(new.bh);
@@ -3260,17 +3251,11 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (new.inode && !test_opt(new.dir->i_sb, NO_AUTO_DA_ALLOC))
 		ext4_alloc_da_blocks(old.inode);
 
-	credits = (2 * EXT4_DATA_TRANS_BLOCKS(old.dir->i_sb) +
-		   EXT4_INDEX_EXTRA_TRANS_BLOCKS + 2);
-	if (!(flags & RENAME_WHITEOUT)) {
-		handle = ext4_journal_start(old.dir, EXT4_HT_DIR, credits);
-		if (IS_ERR(handle))
-			return PTR_ERR(handle);
-	} else {
-		whiteout = ext4_whiteout_for_rename(&old, credits, &handle);
-		if (IS_ERR(whiteout))
-			return PTR_ERR(whiteout);
-	}
+	handle = ext4_journal_start(old.dir, EXT4_HT_DIR,
+		(2 * EXT4_DATA_TRANS_BLOCKS(old.dir->i_sb) +
+		 EXT4_INDEX_EXTRA_TRANS_BLOCKS + 2));
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
 
 	if (IS_DIRSYNC(old.dir) || IS_DIRSYNC(new.dir))
 		ext4_handle_sync(handle);
@@ -3289,24 +3274,28 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 		if (retval)
 			goto end_rename;
 	}
-	old_file_type = old.de->file_type;
-	if (whiteout) {
-		retval = ext4_setent(handle, &old, whiteout->i_ino,
-				     EXT4_FT_CHRDEV);
-		if (retval)
-			goto end_rename;
-		ext4_mark_inode_dirty(handle, whiteout);
-	}
+	/*
+	 * If we're renaming a file within an inline_data dir and adding or
+	 * setting the new dirent causes a conversion from inline_data to
+	 * extents/blockmap, we need to force the dirent delete code to
+	 * re-read the directory, or else we end up trying to delete a dirent
+	 * from what is now the extent tree root (or a block map).
+	 */
+	force_reread = (new.dir->i_ino == old.dir->i_ino &&
+			ext4_test_inode_flag(new.dir, EXT4_INODE_INLINE_DATA));
 	if (!new.bh) {
 		retval = ext4_add_entry(handle, new.dentry, old.inode);
 		if (retval)
 			goto end_rename;
 	} else {
 		retval = ext4_setent(handle, &new,
-				     old.inode->i_ino, old_file_type);
+				     old.inode->i_ino, old.de->file_type);
 		if (retval)
 			goto end_rename;
 	}
+	if (force_reread)
+		force_reread = !ext4_test_inode_flag(new.dir,
+						     EXT4_INODE_INLINE_DATA);
 
 	/*
 	 * Like most other Unix systems, set the ctime for inodes on a
@@ -3315,12 +3304,10 @@ static int ext4_simple_rename(struct inode *old_dir, struct dentry *old_dentry,
 	old.inode->i_ctime = ext4_current_time(old.inode);
 	ext4_mark_inode_dirty(handle, old.inode);
 
-	if (!whiteout) {
-		/*
-		 * ok, that's it
-		 */
-		ext4_rename_delete(handle, &old);
-	}
+	/*
+	 * ok, that's it
+	 */
+	ext4_rename_delete(handle, &old, force_reread);
 
 	if (new.inode) {
 		ext4_dec_count(handle, new.inode);
@@ -3356,12 +3343,6 @@ end_rename:
 	brelse(old.dir_bh);
 	brelse(old.bh);
 	brelse(new.bh);
-	if (whiteout) {
-		if (retval)
-			drop_nlink(whiteout);
-		unlock_new_inode(whiteout);
-		iput(whiteout);
-	}
 	if (handle)
 		ext4_journal_stop(handle);
 	return retval;
@@ -3389,6 +3370,8 @@ static int ext4_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	old.bh = ext4_find_entry(old.dir, &old.dentry->d_name,
 				 &old.de, &old.inlined);
+	if (IS_ERR(old.bh))
+		return PTR_ERR(old.bh);
 	/*
 	 *  Check for inode number is _not_ due to possible IO errors.
 	 *  We might rmdir the source, keep it as pwd of some process
@@ -3401,6 +3384,10 @@ static int ext4_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	new.bh = ext4_find_entry(new.dir, &new.dentry->d_name,
 				 &new.de, &new.inlined);
+	if (IS_ERR(new.bh)) {
+		retval = PTR_ERR(new.bh);
+		goto end_rename;
+	}
 
 	/* RENAME_EXCHANGE case: old *and* new must both exist */
 	if (!new.bh || le32_to_cpu(new.de->inode) != new.inode->i_ino)
@@ -3483,26 +3470,22 @@ end_rename:
 	return retval;
 }
 
-static int ext4_rename(struct inode *old_dir, struct dentry *old_dentry,
-		       struct inode *new_dir, struct dentry *new_dentry)
-{
-	return ext4_simple_rename(old_dir, old_dentry, new_dir, new_dentry, 0);
-}
-
 static int ext4_rename2(struct inode *old_dir, struct dentry *old_dentry,
 			struct inode *new_dir, struct dentry *new_dentry,
 			unsigned int flags)
 {
-	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 
 	if (flags & RENAME_EXCHANGE) {
 		return ext4_cross_rename(old_dir, old_dentry,
 					 new_dir, new_dentry);
 	}
-
-	return ext4_simple_rename(old_dir, old_dentry,
-				  new_dir, new_dentry, flags);
+	/*
+	 * Existence checking was done by the VFS, otherwise "RENAME_NOREPLACE"
+	 * is equivalent to regular rename.
+	 */
+	return ext4_rename(old_dir, old_dentry, new_dir, new_dentry);
 }
 
 /*
