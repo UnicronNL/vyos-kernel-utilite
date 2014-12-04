@@ -18,10 +18,12 @@ void ovl_cleanup(struct inode *wdir, struct dentry *wdentry)
 {
 	int err;
 
+	dget(wdentry);
 	if (S_ISDIR(wdentry->d_inode->i_mode))
 		err = ovl_do_rmdir(wdir, wdentry);
 	else
 		err = ovl_do_unlink(wdir, wdentry);
+	dput(wdentry);
 
 	if (err) {
 		pr_err("overlayfs: cleanup of '%pd2' failed (%i)\n",
@@ -190,13 +192,21 @@ out_unlock:
 static int ovl_lock_rename_workdir(struct dentry *workdir,
 				   struct dentry *upperdir)
 {
+	/* Workdir should not be the same as upperdir */
+	if (workdir == upperdir)
+		goto err;
+
 	/* Workdir should not be subdir of upperdir and vice versa */
-	if (lock_rename(workdir, upperdir) != NULL) {
-		unlock_rename(workdir, upperdir);
-		pr_err("overlayfs: failed to lock workdir+upperdir\n");
-		return -EIO;
-	}
+	if (lock_rename(workdir, upperdir) != NULL)
+		goto err_unlock;
+
 	return 0;
+
+err_unlock:
+	unlock_rename(workdir, upperdir);
+err:
+	pr_err("overlayfs: failed to lock workdir+upperdir\n");
+	return -EIO;
 }
 
 static struct dentry *ovl_clear_empty(struct dentry *dentry,
@@ -219,11 +229,14 @@ static struct dentry *ovl_clear_empty(struct dentry *dentry,
 	ovl_path_upper(dentry, &upperpath);
 	err = vfs_getattr(&upperpath, &stat);
 	if (err)
-		goto out;
+		goto out_unlock;
 
 	err = -ESTALE;
 	if (!S_ISDIR(stat.mode))
-		goto out;
+		goto out_unlock;
+	upper = upperpath.dentry;
+	if (upper->d_parent->d_inode != udir)
+		goto out_unlock;
 
 	opaquedir = ovl_lookup_temp(workdir, dentry);
 	err = PTR_ERR(opaquedir);
@@ -234,7 +247,6 @@ static struct dentry *ovl_clear_empty(struct dentry *dentry,
 	if (err)
 		goto out_dput;
 
-	upper = upperpath.dentry;
 	err = ovl_copy_xattr(upper, opaquedir);
 	if (err)
 		goto out_cleanup;
@@ -243,7 +255,9 @@ static struct dentry *ovl_clear_empty(struct dentry *dentry,
 	if (err)
 		goto out_cleanup;
 
+	mutex_lock(&opaquedir->d_inode->i_mutex);
 	err = ovl_set_attr(opaquedir, &stat);
+	mutex_unlock(&opaquedir->d_inode->i_mutex);
 	if (err)
 		goto out_cleanup;
 
@@ -251,11 +265,9 @@ static struct dentry *ovl_clear_empty(struct dentry *dentry,
 	if (err)
 		goto out_cleanup;
 
-	unlock_rename(workdir, upperdir);
 	ovl_cleanup_whiteouts(upper, list);
-	mutex_lock_nested(&wdir->i_mutex, I_MUTEX_PARENT);
 	ovl_cleanup(wdir, upper);
-	mutex_unlock(&wdir->i_mutex);
+	unlock_rename(workdir, upperdir);
 
 	/* dentry's upper doesn't match now, get rid of it */
 	d_drop(dentry);
@@ -560,11 +572,13 @@ static int ovl_remove_upper(struct dentry *dentry, bool is_dir)
 	mutex_lock_nested(&dir->i_mutex, I_MUTEX_PARENT);
 	err = -ESTALE;
 	if (upper->d_parent == upperdir) {
+		/* Don't let d_delete() think it can reset d_inode */
+		dget(upper);
 		if (is_dir)
 			err = vfs_rmdir(dir, upper);
 		else
 			err = vfs_unlink(dir, upper, NULL);
-
+		dput(upper);
 		ovl_dentry_version_inc(dentry->d_parent);
 	}
 
@@ -609,7 +623,7 @@ static int ovl_do_remove(struct dentry *dentry, bool is_dir)
 		goto out_drop_write;
 
 	type = ovl_path_type(dentry);
-	if (type == OVL_PATH_UPPER && !ovl_dentry_is_opaque(dentry)) {
+	if (type == OVL_PATH_PURE_UPPER) {
 		err = ovl_remove_upper(dentry, is_dir);
 	} else {
 		const struct cred *old_cred;
@@ -691,7 +705,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 	/* Don't copy up directory trees */
 	old_type = ovl_path_type(old);
 	err = -EXDEV;
-	if (old_type != OVL_PATH_UPPER && is_dir)
+	if ((old_type == OVL_PATH_LOWER || old_type == OVL_PATH_MERGE) && is_dir)
 		goto out;
 
 	if (new->d_inode) {
@@ -704,7 +718,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 
 		new_type = ovl_path_type(new);
 		err = -EXDEV;
-		if (!overwrite && new_type != OVL_PATH_UPPER && new_is_dir)
+		if (!overwrite && (new_type == OVL_PATH_LOWER || new_type == OVL_PATH_MERGE) && new_is_dir)
 			goto out;
 
 		err = 0;
@@ -719,7 +733,10 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 				goto out;
 		}
 	} else {
-		new_type = OVL_PATH_UPPER;
+		if (ovl_dentry_is_opaque(new))
+			new_type = OVL_PATH_UPPER;
+		else
+			new_type = OVL_PATH_PURE_UPPER;
 	}
 
 	err = ovl_want_write(old);
@@ -739,8 +756,8 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 			goto out_drop_write;
 	}
 
-	old_opaque = ovl_dentry_is_opaque(old) || old_type != OVL_PATH_UPPER;
-	new_opaque = ovl_dentry_is_opaque(new) || new_type != OVL_PATH_UPPER;
+	old_opaque = old_type != OVL_PATH_PURE_UPPER;
+	new_opaque = new_type != OVL_PATH_PURE_UPPER;
 
 	if (old_opaque || new_opaque) {
 		err = -ENOMEM;
@@ -763,7 +780,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 		old_cred = override_creds(override_cred);
 	}
 
-	if (overwrite && new_type != OVL_PATH_UPPER && new_is_dir) {
+	if (overwrite && (new_type == OVL_PATH_LOWER || new_type == OVL_PATH_MERGE) && new_is_dir) {
 		opaquedir = ovl_check_empty_and_clear(new, new_type);
 		err = PTR_ERR(opaquedir);
 		if (IS_ERR(opaquedir)) {
@@ -864,16 +881,6 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
 
 	if (cleanup_whiteout)
 		ovl_cleanup(old_upperdir->d_inode, newdentry);
-
-	/*
-	 * Copy-up already unhashed it, but then vfs_rename() rehashed it.
-	 * See comment in ovl_copy_up_locked() as to why we drop the dentry().
-	 */
-	if (!is_dir && old_type == OVL_PATH_LOWER)
-		d_drop(old);
-
-	if (!overwrite && !new_is_dir && new_type == OVL_PATH_LOWER)
-		d_drop(new);
 
 	ovl_dentry_version_inc(old->d_parent);
 	ovl_dentry_version_inc(new->d_parent);

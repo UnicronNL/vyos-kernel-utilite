@@ -12,13 +12,13 @@
 struct ovl_entry;
 
 enum ovl_path_type {
+	OVL_PATH_PURE_UPPER,
 	OVL_PATH_UPPER,
 	OVL_PATH_MERGE,
 	OVL_PATH_LOWER,
 };
 
 extern const char *ovl_opaque_xattr;
-extern const struct dentry_operations ovl_dentry_operations;
 
 static inline int ovl_do_rmdir(struct inode *dir, struct dentry *dentry)
 {
@@ -134,6 +134,8 @@ struct dentry *ovl_dentry_upper(struct dentry *dentry);
 struct dentry *ovl_dentry_lower(struct dentry *dentry);
 struct dentry *ovl_dentry_real(struct dentry *dentry);
 struct dentry *ovl_entry_real(struct ovl_entry *oe, bool *is_upper);
+struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
 struct dentry *ovl_workdir(struct dentry *dentry);
 int ovl_want_write(struct dentry *dentry);
 void ovl_drop_write(struct dentry *dentry);
@@ -182,6 +184,8 @@ void ovl_cleanup(struct inode *dir, struct dentry *dentry);
 
 /* copy_up.c */
 int ovl_copy_up(struct dentry *dentry);
-int ovl_copy_up_truncate(struct dentry *dentry, loff_t size);
+int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+		    struct path *lowerpath, struct kstat *stat,
+		    struct iattr *attr);
 int ovl_copy_xattr(struct dentry *old, struct dentry *new);
 int ovl_set_attr(struct dentry *upper, struct kstat *stat);

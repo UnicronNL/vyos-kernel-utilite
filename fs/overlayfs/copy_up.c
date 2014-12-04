@@ -172,7 +172,6 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 {
 	int err = 0;
 
-	mutex_lock(&upperdentry->d_inode->i_mutex);
 	if (!S_ISLNK(stat->mode)) {
 		struct iattr attr = {
 			.ia_valid = ATTR_MODE,
@@ -190,7 +189,6 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 	}
 	if (!err)
 		ovl_set_timestamps(upperdentry, stat);
-	mutex_unlock(&upperdentry->d_inode->i_mutex);
 
 	return err;
 
@@ -198,7 +196,8 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 
 static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 			      struct dentry *dentry, struct path *lowerpath,
-			      struct kstat *stat, const char *link)
+			      struct kstat *stat, struct iattr *attr,
+			      const char *link)
 {
 	struct inode *wdir = workdir->d_inode;
 	struct inode *udir = upperdir->d_inode;
@@ -216,14 +215,14 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 			       dentry->d_name.len);
 	err = PTR_ERR(upper);
 	if (IS_ERR(upper))
-		goto out;
+		goto out1;
 
 	/* Can't properly set mode on creation because of the umask */
 	stat->mode &= S_IFMT;
 	err = ovl_create_real(wdir, newdentry, stat, link, NULL, true);
 	stat->mode = mode;
 	if (err)
-		goto out;
+		goto out2;
 
 	if (S_ISREG(stat->mode)) {
 		struct path upperpath;
@@ -240,7 +239,11 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 	if (err)
 		goto out_cleanup;
 
+	mutex_lock(&newdentry->d_inode->i_mutex);
 	err = ovl_set_attr(newdentry, stat);
+	if (!err && attr)
+		err = notify_change(newdentry, attr, NULL);
+	mutex_unlock(&newdentry->d_inode->i_mutex);
 	if (err)
 		goto out_cleanup;
 
@@ -252,19 +255,15 @@ static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
 	newdentry = NULL;
 
 	/*
-	 * Easiest way to get rid of the lower dentry reference is to
-	 * drop this dentry.  This is neither needed nor possible for
-	 * directories.
-	 *
 	 * Non-directores become opaque when copied up.
 	 */
-	if (!S_ISDIR(stat->mode)) {
+	if (!S_ISDIR(stat->mode))
 		ovl_dentry_set_opaque(dentry, true);
-		d_drop(dentry);
-	}
-out:
+out2:
 	dput(upper);
+out1:
 	dput(newdentry);
+out:
 	return err;
 
 out_cleanup:
@@ -287,14 +286,16 @@ out_cleanup:
  * d_parent it is possible that the copy up will lock the old parent.  At
  * that point the file will have already been copied up anyway.
  */
-static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
-			   struct path *lowerpath, struct kstat *stat)
+int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
+		    struct path *lowerpath, struct kstat *stat,
+		    struct iattr *attr)
 {
 	struct dentry *workdir = ovl_workdir(dentry);
 	int err;
 	struct kstat pstat;
 	struct path parentpath;
 	struct dentry *upperdir;
+	struct dentry *upperdentry;
 	const struct cred *old_cred;
 	struct cred *override_cred;
 	char *link = NULL;
@@ -340,19 +341,28 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 		pr_err("overlayfs: failed to lock workdir+upperdir\n");
 		goto out_unlock;
 	}
-	if (ovl_path_type(dentry) != OVL_PATH_LOWER) {
+	upperdentry = ovl_dentry_upper(dentry);
+	if (upperdentry) {
+		unlock_rename(workdir, upperdir);
 		err = 0;
-	} else {
-		err = ovl_copy_up_locked(workdir, upperdir, dentry, lowerpath,
-					 stat, link);
-		if (!err) {
-			/* Restore timestamps on parent (best effort) */
-			ovl_set_timestamps(upperdir, &pstat);
+		/* Raced with another copy-up?  Do the setattr here */
+		if (attr) {
+			mutex_lock(&upperdentry->d_inode->i_mutex);
+			err = notify_change(upperdentry, attr, NULL);
+			mutex_unlock(&upperdentry->d_inode->i_mutex);
 		}
+		goto out_put_cred;
+	}
+
+	err = ovl_copy_up_locked(workdir, upperdir, dentry, lowerpath,
+				 stat, attr, link);
+	if (!err) {
+		/* Restore timestamps on parent (best effort) */
+		ovl_set_timestamps(upperdir, &pstat);
 	}
 out_unlock:
 	unlock_rename(workdir, upperdir);
-
+out_put_cred:
 	revert_creds(old_cred);
 	put_cred(override_cred);
 
@@ -394,38 +404,11 @@ int ovl_copy_up(struct dentry *dentry)
 		ovl_path_lower(next, &lowerpath);
 		err = vfs_getattr(&lowerpath, &stat);
 		if (!err)
-			err = ovl_copy_up_one(parent, next, &lowerpath, &stat);
+			err = ovl_copy_up_one(parent, next, &lowerpath, &stat, NULL);
 
 		dput(parent);
 		dput(next);
 	}
 
-	return err;
-}
-
-/* Optimize by not copying up the file first and truncating later */
-int ovl_copy_up_truncate(struct dentry *dentry, loff_t size)
-{
-	int err;
-	struct kstat stat;
-	struct path lowerpath;
-	struct dentry *parent = dget_parent(dentry);
-
-	err = ovl_copy_up(parent);
-	if (err)
-		goto out_dput_parent;
-
-	ovl_path_lower(dentry, &lowerpath);
-	err = vfs_getattr(&lowerpath, &stat);
-	if (err)
-		goto out_dput_parent;
-
-	if (size < stat.size)
-		stat.size = size;
-
-	err = ovl_copy_up_one(parent, dentry, &lowerpath, &stat);
-
-out_dput_parent:
-	dput(parent);
 	return err;
 }

@@ -12,34 +12,51 @@
 #include <linux/xattr.h>
 #include "overlayfs.h"
 
+static int ovl_copy_up_last(struct dentry *dentry, struct iattr *attr,
+			    bool no_data)
+{
+	int err;
+	struct dentry *parent;
+	struct kstat stat;
+	struct path lowerpath;
+
+	parent = dget_parent(dentry);
+	err = ovl_copy_up(parent);
+	if (err)
+		goto out_dput_parent;
+
+	ovl_path_lower(dentry, &lowerpath);
+	err = vfs_getattr(&lowerpath, &stat);
+	if (err)
+		goto out_dput_parent;
+
+	if (no_data)
+		stat.size = 0;
+
+	err = ovl_copy_up_one(parent, dentry, &lowerpath, &stat, attr);
+
+out_dput_parent:
+	dput(parent);
+	return err;
+}
+
 int ovl_setattr(struct dentry *dentry, struct iattr *attr)
 {
-	struct dentry *upperdentry;
 	int err;
+	struct dentry *upperdentry;
 
 	err = ovl_want_write(dentry);
 	if (err)
 		goto out;
 
-	if ((attr->ia_valid & ATTR_SIZE) && !ovl_dentry_upper(dentry))
-		err = ovl_copy_up_truncate(dentry, attr->ia_size);
-	else
-		err = ovl_copy_up(dentry);
-	if (err)
-		goto out_drop_write;
-
 	upperdentry = ovl_dentry_upper(dentry);
-
-	if (attr->ia_valid & (ATTR_KILL_SUID|ATTR_KILL_SGID))
-		attr->ia_valid &= ~ATTR_MODE;
-
-	mutex_lock(&upperdentry->d_inode->i_mutex);
-	err = notify_change(upperdentry, attr, NULL);
-	if (!err)
-		ovl_copyattr(upperdentry->d_inode, dentry->d_inode);
-	mutex_unlock(&upperdentry->d_inode->i_mutex);
-
-out_drop_write:
+	if (upperdentry) {
+		mutex_lock(&upperdentry->d_inode->i_mutex);
+		err = notify_change(upperdentry, attr, NULL);
+		mutex_unlock(&upperdentry->d_inode->i_mutex);
+	} else {
+		err = ovl_copy_up_last(dentry, attr, false);
+	}
 	ovl_drop_write(dentry);
 out:
 	return err;
@@ -323,7 +340,7 @@ static int ovl_dentry_open(struct dentry *dentry, struct file *file,
 			goto out;
 
 		if (file->f_flags & O_TRUNC)
-			err = ovl_copy_up_truncate(dentry, 0);
+			err = ovl_copy_up_last(dentry, NULL, true);
 		else
 			err = ovl_copy_up(dentry);
 		if (err)

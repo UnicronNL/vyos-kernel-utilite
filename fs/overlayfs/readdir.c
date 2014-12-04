@@ -27,6 +27,12 @@ struct ovl_cache_entry {
 	struct rb_node node;
 };
 
+struct ovl_dir_cache {
+	long refcount;
+	u64 version;
+	struct list_head entries;
+};
+
 struct ovl_readdir_data {
 	struct dir_context ctx;
 	bool is_merge;
@@ -39,11 +45,11 @@ struct ovl_readdir_data {
 
 struct ovl_dir_file {
 	bool is_real;
-	bool is_cached;
-	struct list_head cursor;
-	u64 cache_version;
-	struct list_head cache;
+	bool is_upper;
+	struct ovl_dir_cache *cache;
+	struct ovl_cache_entry cursor;
 	struct file *realfile;
+	struct file *upperfile;
 };
 
 static struct ovl_cache_entry *ovl_cache_entry_from_node(struct rb_node *n)
@@ -157,6 +163,22 @@ void ovl_cache_free(struct list_head *list)
 	INIT_LIST_HEAD(list);
 }
 
+static void ovl_cache_put(struct ovl_dir_file *od, struct dentry *dentry)
+{
+	struct ovl_dir_cache *cache = od->cache;
+
+	list_del(&od->cursor.l_node);
+	WARN_ON(cache->refcount <= 0);
+	cache->refcount--;
+	if (!cache->refcount) {
+		if (ovl_dir_cache(dentry) == cache)
+			ovl_set_dir_cache(dentry, NULL);
+
+		ovl_cache_free(&cache->entries);
+		kfree(cache);
+	}
+}
+
 static int ovl_fill_merge(void *buf, const char *name, int namelen,
 			  loff_t offset, u64 ino, unsigned int d_type)
 {
@@ -195,19 +217,17 @@ static inline int ovl_dir_read(struct path *realpath,
 static void ovl_dir_reset(struct file *file)
 {
 	struct ovl_dir_file *od = file->private_data;
-	enum ovl_path_type type = ovl_path_type(file->f_path.dentry);
+	struct ovl_dir_cache *cache = od->cache;
+	struct dentry *dentry = file->f_path.dentry;
+	enum ovl_path_type type = ovl_path_type(dentry);
 
-	if (ovl_dentry_version_get(file->f_path.dentry) != od->cache_version) {
-		list_del_init(&od->cursor);
-		ovl_cache_free(&od->cache);
-		od->is_cached = false;
+	if (cache && ovl_dentry_version_get(dentry) != cache->version) {
+		ovl_cache_put(od, dentry);
+		od->cache = NULL;
 	}
 	WARN_ON(!od->is_real && type != OVL_PATH_MERGE);
-	if (od->is_real && type == OVL_PATH_MERGE) {
-		fput(od->realfile);
-		od->realfile = NULL;
+	if (od->is_real && type == OVL_PATH_MERGE)
 		od->is_real = false;
-	}
 }
 
 static int ovl_dir_mark_whiteouts(struct dentry *dir,
@@ -232,6 +252,9 @@ static int ovl_dir_mark_whiteouts(struct dentry *dir,
 
 	mutex_lock(&dir->d_inode->i_mutex);
 	list_for_each_entry(p, rdd->list, l_node) {
+		if (!p->name)
+			continue;
+
 		if (p->type != DT_CHR)
 			continue;
 
@@ -293,63 +316,92 @@ out:
 
 static void ovl_seek_cursor(struct ovl_dir_file *od, loff_t pos)
 {
-	struct list_head *l;
-	loff_t off;
+	struct ovl_cache_entry *p;
+	loff_t off = 0;
 
-	l = od->cache.next;
-	for (off = 0; off < pos; off++) {
-		if (l == &od->cache)
+	list_for_each_entry(p, &od->cache->entries, l_node) {
+		if (!p->name)
+			continue;
+		if (off >= pos)
 			break;
-		l = l->next;
+		off++;
 	}
-	list_move_tail(&od->cursor, l);
+	list_move_tail(&od->cursor.l_node, &p->l_node);
+}
+
+static struct ovl_dir_cache *ovl_cache_get(struct dentry *dentry)
+{
+	int res;
+	struct path lowerpath;
+	struct path upperpath;
+	struct ovl_dir_cache *cache;
+
+	cache = ovl_dir_cache(dentry);
+	if (cache && ovl_dentry_version_get(dentry) == cache->version) {
+		cache->refcount++;
+		return cache;
+	}
+	ovl_set_dir_cache(dentry, NULL);
+
+	cache = kzalloc(sizeof(struct ovl_dir_cache), GFP_KERNEL);
+	if (!cache)
+		return ERR_PTR(-ENOMEM);
+
+	cache->refcount = 1;
+	INIT_LIST_HEAD(&cache->entries);
+
+	ovl_path_lower(dentry, &lowerpath);
+	ovl_path_upper(dentry, &upperpath);
+
+	res = ovl_dir_read_merged(&upperpath, &lowerpath, &cache->entries);
+	if (res) {
+		ovl_cache_free(&cache->entries);
+		kfree(cache);
+		return ERR_PTR(res);
+	}
+
+	cache->version = ovl_dentry_version_get(dentry);
+	ovl_set_dir_cache(dentry, cache);
+
+	return cache;
 }
 
 static int ovl_iterate(struct file *file, struct dir_context *ctx)
 {
 	struct ovl_dir_file *od = file->private_data;
-	int res;
+	struct dentry *dentry = file->f_path.dentry;
 
 	if (!ctx->pos)
 		ovl_dir_reset(file);
 
-	if (od->is_real) {
-		res = iterate_dir(od->realfile, ctx);
+	if (od->is_real)
+		return iterate_dir(od->realfile, ctx);
 
-		return res;
-	}
+	if (!od->cache) {
+		struct ovl_dir_cache *cache;
 
-	if (!od->is_cached) {
-		struct path lowerpath;
-		struct path upperpath;
+		cache = ovl_cache_get(dentry);
+		if (IS_ERR(cache))
+			return PTR_ERR(cache);
 
-		ovl_path_lower(file->f_path.dentry, &lowerpath);
-		ovl_path_upper(file->f_path.dentry, &upperpath);
-
-		res = ovl_dir_read_merged(&upperpath, &lowerpath, &od->cache);
-		if (res) {
-			ovl_cache_free(&od->cache);
-			return res;
-		}
-
-		od->cache_version = ovl_dentry_version_get(file->f_path.dentry);
-		od->is_cached = true;
-
+		od->cache = cache;
 		ovl_seek_cursor(od, ctx->pos);
 	}
 
-	while (od->cursor.next != &od->cache) {
+	while (od->cursor.l_node.next != &od->cache->entries) {
 		struct ovl_cache_entry *p;
 
-		p = list_entry(od->cursor.next, struct ovl_cache_entry, l_node);
-		if (!p->is_whiteout) {
-			if (!dir_emit(ctx, p->name, p->len, p->ino, p->type))
-				break;
+		p = list_entry(od->cursor.l_node.next, struct ovl_cache_entry, l_node);
+		/* Skip cursors */
+		if (p->name) {
+			if (!p->is_whiteout) {
+				if (!dir_emit(ctx, p->name, p->len, p->ino, p->type))
+					break;
+			}
+			ctx->pos++;
 		}
-		ctx->pos++;
-		list_move(&od->cursor, &p->l_node);
+		list_move(&od->cursor.l_node, &p->l_node);
 	}
-
 	return 0;
 }
 
@@ -382,7 +434,7 @@ static loff_t ovl_dir_llseek(struct file *file, loff_t offset, int origin)
 
 		if (offset != file->f_pos) {
 			file->f_pos = offset;
-			if (od->is_cached)
+			if (od->cache)
 				ovl_seek_cursor(od, offset);
 		}
 		res = offset;
@@ -397,28 +449,46 @@ static int ovl_dir_fsync(struct file *file, loff_t start, loff_t end,
 			 int datasync)
 {
 	struct ovl_dir_file *od = file->private_data;
+	struct dentry *dentry = file->f_path.dentry;
+	struct file *realfile = od->realfile;
 
-	/* May need to reopen directory if it got copied up */
-	if (!od->realfile) {
-		struct path upperpath;
+	/*
+	 * Need to check if we started out being a lower dir, but got copied up
+	 */
+	if (!od->is_upper && ovl_path_type(dentry) == OVL_PATH_MERGE) {
+		struct inode *inode = file_inode(file);
 
-		ovl_path_upper(file->f_path.dentry, &upperpath);
-		od->realfile = ovl_path_open(&upperpath, O_RDONLY);
-		if (IS_ERR(od->realfile))
-			return PTR_ERR(od->realfile);
+		mutex_lock(&inode->i_mutex);
+		realfile = od->upperfile;
+		if (!realfile) {
+			struct path upperpath;
+
+			ovl_path_upper(dentry, &upperpath);
+			realfile = ovl_path_open(&upperpath, O_RDONLY);
+			if (IS_ERR(realfile)) {
+				mutex_unlock(&inode->i_mutex);
+				return PTR_ERR(realfile);
+			}
+			od->upperfile = realfile;
+		}
+		mutex_unlock(&inode->i_mutex);
 	}
 
-	return vfs_fsync_range(od->realfile, start, end, datasync);
+	return vfs_fsync_range(realfile, start, end, datasync);
 }
 
 static int ovl_dir_release(struct inode *inode, struct file *file)
 {
 	struct ovl_dir_file *od = file->private_data;
 
-	list_del(&od->cursor);
-	ovl_cache_free(&od->cache);
-	if (od->realfile)
-		fput(od->realfile);
+	if (od->cache) {
+		mutex_lock(&inode->i_mutex);
+		ovl_cache_put(od, file->f_path.dentry);
+		mutex_unlock(&inode->i_mutex);
+	}
+	fput(od->realfile);
+	if (od->upperfile)
+		fput(od->upperfile);
 	kfree(od);
 
 	return 0;
@@ -441,11 +511,10 @@ static int ovl_dir_open(struct inode *inode, struct file *file)
 		kfree(od);
 		return PTR_ERR(realfile);
 	}
-	INIT_LIST_HEAD(&od->cache);
-	INIT_LIST_HEAD(&od->cursor);
-	od->is_cached = false;
+	INIT_LIST_HEAD(&od->cursor.l_node);
 	od->realfile = realfile;
 	od->is_real = (type != OVL_PATH_MERGE);
+	od->is_upper = (type != OVL_PATH_LOWER);
 	file->private_data = od;
 
 	return 0;
